@@ -1,8 +1,11 @@
 import cn.hutool.core.util.RandomUtil;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
+
 
 import java.util.Calendar;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.*;
 
 /**
  * 抢菜主程序 只能用于高峰期 并且运行两分钟以内 如未抢到不要再继续执行
@@ -39,7 +42,8 @@ public class Application {
         //policy设置1 人工模式 运行程序则开始抢
         //policy设置2 时间触发 运行程序后等待早上5点59分30秒开始
         //policy设置3 时间触发 运行程序后等待早上8点29分30秒开始
-        int policy = 1;//默认人工模式
+        //默认人工模式
+        int policy = 1;
 
         //最小订单成交金额 举例如果设置成50 那么订单要超过50才会下单
         double minOrderPrice = 0;
@@ -65,9 +69,102 @@ public class Application {
         while (policy == 3 && !timeTrigger(8, 29, 30)) {
         }
 
+        //定义线程池执，优点
+        /*
+        降低资源消耗。通过重复利用已创建的线程降低线程创建和销毁造成的资源浪费。
+        提高响应速度。当任务到达时，不需要等到线程创建就能立即执行。
+        方便管理线程。线程是稀缺资源，如果无限制地创建，不仅会消耗系统资源，还会降低系统的稳定性，使用线程池可以对线程进行统一的分配，优化及监控。*/
+
+
+        ThreadFactory namedThreadFactory = new ThreadFactoryBuilder().setNameFormat("demo-pool-%d").build();
+        ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(20,40,30, TimeUnit.SECONDS,new LinkedBlockingQueue<>(5),namedThreadFactory,new ThreadPoolExecutor.AbortPolicy());
 
         //保护线程 2分钟未下单自动终止 避免对叮咚服务器造成压力 也避免封号  如果想长时间执行 请使用Sentinel哨兵模式
-        new Thread(() -> {
+        threadPoolExecutor.execute(() -> {
+            for (int i = 0; i < 120 && !Api.context.containsKey("end"); i++) {
+                sleep(1000);
+            }
+            if (!Api.context.containsKey("end")) {
+                Api.context.put("end", new HashMap<>());
+                sleep(3000);
+                System.err.println("未成功下单，执行2分钟自动停止");
+            }
+        });
+
+        for (int i = 0; i < baseTheadSize; i++) {
+            threadPoolExecutor.execute(() -> {
+                while (!Api.context.containsKey("end")) {
+                    Api.allCheck();
+                    //此接口作为补充使用 并不是一定需要 所以执行间隔拉大一点
+                    sleep(RandomUtil.randomInt(3000, 5000));
+                }
+            });
+        }
+
+        for (int i = 0; i < baseTheadSize; i++) {
+            threadPoolExecutor.execute(() -> {
+                while (!Api.context.containsKey("end")) {
+                    Map<String, Object> cartMap = Api.getCart(policy == 2 || policy == 3);
+                    if (cartMap != null) {
+                        if (Double.parseDouble(cartMap.get("total_money").toString()) < minOrderPrice) {
+                            System.err.println("订单金额：" + cartMap.get("total_money").toString() + " 不满足最小金额设置：" + minOrderPrice + " 继续重试");
+                        } else {
+                            Api.context.put("cartMap", cartMap);
+                        }
+                    }
+                    sleep(RandomUtil.randomInt(sleepMillisMin, sleepMillisMax));
+                }
+            });
+        }
+        for (int i = 0; i < baseTheadSize; i++) {
+            threadPoolExecutor.execute(() -> {
+                while (!Api.context.containsKey("end")) {
+                    sleep(RandomUtil.randomInt(sleepMillisMin, sleepMillisMax));
+                    if (Api.context.get("cartMap") == null) {
+                        continue;
+                    }
+                    Map<String, Object> multiReserveTimeMap = Api.getMultiReserveTime(UserConfig.addressId, Api.context.get("cartMap"));
+                    if (multiReserveTimeMap != null) {
+                        Api.context.put("multiReserveTimeMap", multiReserveTimeMap);
+                    }
+                }
+            });
+        }
+
+        for (int i = 0; i < baseTheadSize; i++) {
+            threadPoolExecutor.execute(() -> {
+                while (!Api.context.containsKey("end")) {
+                    sleep(RandomUtil.randomInt(sleepMillisMin, sleepMillisMax));
+                    if (Api.context.get("cartMap") == null || Api.context.get("multiReserveTimeMap") == null) {
+                        continue;
+                    }
+                    Map<String, Object> checkOrderMap = Api.getCheckOrder(UserConfig.addressId, Api.context.get("cartMap"), Api.context.get("multiReserveTimeMap"));
+                    if (checkOrderMap != null) {
+                        Api.context.put("checkOrderMap", checkOrderMap);
+                    }
+                }
+            });
+        }
+
+        for (int i = 0; i < submitOrderTheadSize; i++) {
+            threadPoolExecutor.execute(() -> {
+                while (!Api.context.containsKey("end")) {
+                    if (Api.context.get("cartMap") == null || Api.context.get("multiReserveTimeMap") == null || Api.context.get("checkOrderMap") == null) {
+                        continue;
+                    }
+                    if (Api.addNewOrder(UserConfig.addressId, Api.context.get("cartMap"), Api.context.get("multiReserveTimeMap"), Api.context.get("checkOrderMap"))) {
+                        System.out.println("铃声持续1分钟，终止程序即可，如果还需要下单再继续运行程序");
+                        Api.play();
+                    }
+                }
+            });
+        }
+
+        threadPoolExecutor.shutdown();
+
+
+        //非线程池，直接实现run接口
+        /*new Thread(() -> {
             for (int i = 0; i < 120 && !Api.context.containsKey("end"); i++) {
                 sleep(1000);
             }
@@ -143,6 +240,6 @@ public class Application {
                     }
                 }
             }).start();
-        }
+        }*/
     }
 }
